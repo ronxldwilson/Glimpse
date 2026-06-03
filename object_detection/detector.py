@@ -1,7 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 
-from .segment import slic_segment, extract_region_image, Region
+from .segment import segment, extract_region_image, Region
 from .encoder import CLIPEncoder
 
 
@@ -18,17 +18,8 @@ class ObjectDetector:
         self,
         model_name: str = "ViT-B-32",
         pretrained: str = "laion2b_s34b_b79k",
-        num_superpixels: int = 200,
-        compactness: float = 10.0,
-        min_region_ratio: float = 0.01,
-        merge_threshold: float = 20.0,
     ):
         self.encoder = CLIPEncoder(model_name, pretrained)
-        self.num_superpixels = num_superpixels
-        self.compactness = compactness
-        self.min_region_ratio = min_region_ratio
-        self.merge_threshold = merge_threshold
-
         self._vocab_embeddings: np.ndarray | None = None
         self._vocab_labels: list[str] = []
 
@@ -52,13 +43,7 @@ class ObjectDetector:
         else:
             raise ValueError("No vocabulary set. Call set_vocabulary() or pass labels.")
 
-        regions = slic_segment(
-            image,
-            self.num_superpixels,
-            self.compactness,
-            self.min_region_ratio,
-            self.merge_threshold,
-        )
+        regions = segment(image)
 
         if not regions:
             return []

@@ -1,6 +1,9 @@
 import cv2
 import numpy as np
 from dataclasses import dataclass
+from pathlib import Path
+
+from ultralytics import FastSAM
 
 
 @dataclass
@@ -11,104 +14,134 @@ class Region:
     crop: np.ndarray
 
 
-def slic_segment(
+_model: FastSAM | None = None
+
+
+def _get_model() -> FastSAM:
+    global _model
+    if _model is not None:
+        return _model
+
+    weights = Path(__file__).parent.parent / "models" / "FastSAM-s.pt"
+    _model = FastSAM(str(weights))
+    return _model
+
+
+def segment(
     image: np.ndarray,
-    num_superpixels: int = 200,
-    compactness: float = 10.0,
-    min_region_ratio: float = 0.01,
-    merge_threshold: float = 20.0,
+    min_region_ratio: float = 0.005,
+    conf: float = 0.4,
+    iou: float = 0.9,
 ) -> list[Region]:
     h, w = image.shape[:2]
     min_area = int(h * w * min_region_ratio)
 
-    slic = cv2.ximgproc.createSuperpixelSLIC(
-        image, cv2.ximgproc.SLIC, num_superpixels, compactness
-    )
-    slic.iterate(10)
-    slic.enforceLabelConnectivity(25)
-    labels = slic.getLabels()
-    n_labels = slic.getNumberOfSuperpixels()
+    model = _get_model()
+    results = model(image, conf=conf, iou=iou, imgsz=640, verbose=False)
 
-    merged_labels = _merge_similar(image, labels, n_labels, merge_threshold)
+    masks_data = results[0].masks
+    if masks_data is None:
+        return []
+
+    raw_masks = masks_data.data.cpu().numpy()
+    boxes = results[0].boxes.xyxy.cpu().numpy()
 
     regions = []
-    for label_id in np.unique(merged_labels):
-        mask = (merged_labels == label_id).astype(np.uint8)
+    for i in range(len(raw_masks)):
+        mask_small = raw_masks[i]
+        mask = cv2.resize(mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+        mask = (mask > 0.5).astype(np.uint8)
+
         area = int(mask.sum())
         if area < min_area:
             continue
 
-        coords = cv2.findNonZero(mask)
-        if coords is None:
+        x1, y1, x2, y2 = boxes[i].astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
             continue
-        x, y, rw, rh = cv2.boundingRect(coords)
 
-        crop = image[y : y + rh, x : x + rw].copy()
-        crop_mask = mask[y : y + rh, x : x + rw]
-        crop[crop_mask == 0] = 0
+        crop = image[y1:y2, x1:x2].copy()
+        crop_mask = mask[y1:y2, x1:x2]
+        crop[crop_mask == 0] = 255
 
-        regions.append(Region(mask=mask, bbox=(x, y, rw, rh), area=area, crop=crop))
+        regions.append(Region(mask=mask, bbox=(x1, y1, bw, bh), area=area, crop=crop))
 
     regions.sort(key=lambda r: r.area, reverse=True)
     return regions
 
 
-def _merge_similar(
+def merge_nearby_regions(
     image: np.ndarray,
-    labels: np.ndarray,
-    n_labels: int,
-    threshold: float,
-) -> np.ndarray:
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    regions: list[Region],
+    iou_threshold: float = 0.05,
+    distance_ratio: float = 0.3,
+) -> list[Region]:
+    if len(regions) <= 1:
+        return regions
 
-    means = np.zeros((n_labels, 3), dtype=np.float32)
-    for i in range(n_labels):
-        mask = labels == i
-        if mask.any():
-            means[i] = lab[mask].mean(axis=0)
+    merged_extra = []
+    used = set()
 
-    parent = list(range(n_labels))
+    for i in range(len(regions)):
+        if i in used:
+            continue
+        group = [i]
+        for j in range(i + 1, len(regions)):
+            if j in used:
+                continue
+            if _masks_nearby(regions[i], regions[j], iou_threshold, distance_ratio):
+                group.append(j)
+                used.add(j)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+        if len(group) > 1:
+            combined_mask = np.zeros_like(regions[group[0]].mask)
+            for idx in group:
+                combined_mask = np.bitwise_or(combined_mask, regions[idx].mask)
 
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+            coords = cv2.findNonZero(combined_mask)
+            if coords is not None:
+                x, y, w, h = cv2.boundingRect(coords)
+                area = int(combined_mask.sum())
+                crop = image[y : y + h, x : x + w].copy()
+                crop_mask = combined_mask[y : y + h, x : x + w]
+                crop[crop_mask == 0] = 255
+                merged_extra.append(Region(
+                    mask=combined_mask, bbox=(x, y, w, h), area=area, crop=crop,
+                ))
 
-    adjacency = set()
-    for y in range(labels.shape[0] - 1):
-        for x in range(labels.shape[1] - 1):
-            c = labels[y, x]
-            r = labels[y, x + 1]
-            d = labels[y + 1, x]
-            if c != r:
-                adjacency.add((min(c, r), max(c, r)))
-            if c != d:
-                adjacency.add((min(c, d), max(c, d)))
+    all_regions = regions + merged_extra
+    all_regions.sort(key=lambda r: r.area, reverse=True)
+    return all_regions
 
-    for a, b in adjacency:
-        dist = np.linalg.norm(means[a] - means[b])
-        if dist < threshold:
-            union(a, b)
 
-    merged = labels.copy()
-    for i in range(n_labels):
-        merged[labels == i] = find(i)
+def _masks_nearby(a: Region, b: Region, iou_thresh: float, dist_ratio: float) -> bool:
+    ax, ay, aw, ah = a.bbox
+    bx, by, bw, bh = b.bbox
 
-    return merged
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+
+    if x2 > x1 and y2 > y1:
+        inter = (x2 - x1) * (y2 - y1)
+        union = aw * ah + bw * bh - inter
+        if union > 0 and inter / union >= iou_thresh:
+            return True
+
+    acx, acy = ax + aw / 2, ay + ah / 2
+    bcx, bcy = bx + bw / 2, by + bh / 2
+    dist = ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5
+    max_dim = max(aw, ah, bw, bh)
+    return dist < max_dim * dist_ratio
 
 
 def extract_region_image(image: np.ndarray, region: Region) -> np.ndarray:
     x, y, w, h = region.bbox
     crop = image[y : y + h, x : x + w].copy()
-
     mask_crop = region.mask[y : y + h, x : x + w]
-    bg = np.median(crop[mask_crop == 1], axis=0).astype(np.uint8) if mask_crop.any() else np.array([128, 128, 128], dtype=np.uint8)
-    crop[mask_crop == 0] = bg
-
+    crop[mask_crop == 0] = 255
     return crop

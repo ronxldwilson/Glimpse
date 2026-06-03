@@ -7,4 +7,7 @@ build/
 .env
 models/
 *.onnx
+*.onnx.data
 test_images/
+demo.html
+uv.lock
