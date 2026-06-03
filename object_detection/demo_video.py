@@ -25,18 +25,18 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
     for label, info in list(s.objects.items())[:50]:
         n_frames = len(info["frames"])
         pct = n_frames / max(s.keyframes_analyzed, 1) * 100
-        path_short = " > ".join(info["path"][-3:]) if len(info["path"]) > 1 else label
         bar_pct = min(pct, 100)
         time_range = f"{info['first_seen']:.1f}s - {info['last_seen']:.1f}s"
+        sources = ", ".join(info.get("sources", []))
 
         obj_html += f"""<div class="obj-card">
   <div class="obj-name">{label}</div>
-  <div class="obj-path">{path_short}</div>
   <div class="obj-stats">
     <span class="obj-frames">{n_frames} frame{"s" if n_frames != 1 else ""}</span>
     <span class="obj-time">{time_range}</span>
     <span class="obj-score">{info['peak_score']:.3f}</span>
   </div>
+  <div class="obj-source">{sources}</div>
   <div class="obj-bar"><div class="obj-bar-fill" style="width:{bar_pct:.0f}%"></div></div>
 </div>"""
 
@@ -65,7 +65,8 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
     frames_json_items = []
     for i, fr in enumerate(s.timeline):
         objs = [{"label": o["label"], "score": o["score"],
-                 "path": " > ".join(o["path"][-3:]) if len(o["path"]) > 1 else o["label"]}
+                 "source": o.get("source", ""),
+                 "path": o["label"]}
                 for o in fr.objects[:15]]
         frames_json_items.append({
             "timestamp": round(fr.timestamp, 2),
@@ -102,6 +103,7 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
   .obj-stats {{ display: flex; gap: 8px; font-size: 0.7rem; color: #888; margin-bottom: 4px; }}
   .obj-frames {{ color: #aaa; }}
   .obj-score {{ color: #4fc3f7; }}
+  .obj-source {{ font-size: 0.6rem; color: #555; margin-bottom: 3px; }}
   .obj-bar {{ height: 3px; background: #333; border-radius: 2px; overflow: hidden; }}
   .obj-bar-fill {{ height: 100%; background: linear-gradient(90deg, #4fc3f7, #29b6f6); border-radius: 2px; }}
 
@@ -176,7 +178,7 @@ function showFrame(idx) {{
   objs.innerHTML = f.objects.map(o =>
     '<div class="frame-det">' +
       '<div><span class="frame-det-label">' + o.label + '</span> ' +
-      '<span class="frame-det-path">' + o.path + '</span></div>' +
+      '<span class="frame-det-path">' + (o.source || '') + '</span></div>' +
       '<span class="frame-det-score">' + o.score.toFixed(3) + '</span>' +
     '</div>'
   ).join('') || '<div class="frame-det" style="color:#666">No objects detected</div>';

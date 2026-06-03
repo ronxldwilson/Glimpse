@@ -1,6 +1,5 @@
-"""Video analysis pipeline — extract keyframes, detect objects, build timeline."""
+"""Video analysis pipeline — extract keyframes, detect objects via MoE, build timeline."""
 
-import json
 import os
 import subprocess
 import tempfile
@@ -11,10 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .segment import segment, merge_nearby_regions, extract_region_image
-from .encoder import CLIPEncoder
-from .taxonomy import build_taxonomy, encode_taxonomy
-from .discover import discover_objects
+from .moe import detect_moe, reset_tracker, MoeDetection
 
 
 @dataclass
@@ -130,21 +126,12 @@ def _extract_fixed_fps(
     return frames
 
 
-def _frame_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    ha = cv2.calcHist([a], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-    hb = cv2.calcHist([b], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-    cv2.normalize(ha, ha)
-    cv2.normalize(hb, hb)
-    return float(cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL))
-
-
 def analyze_video(
     video_path: str,
     mode: str = "scene",
     scene_threshold: float = 0.3,
     fixed_fps: float = 1.0,
     max_frames: int = 200,
-    skip_similarity: float = 0.95,
 ) -> VideoManifest:
     t_total = time.perf_counter()
 
@@ -166,87 +153,69 @@ def analyze_video(
             keyframes_analyzed=0, objects={}, timeline=[], processing_time_ms=0,
         )
 
-    _log("Loading CLIP + building taxonomy...")
+    _log("Loading models (MoE: YOLO-World + CLIP + scene + tracking)...")
+    reset_tracker()
+    # Warmup — first call loads all models
     t0 = time.perf_counter()
-    encoder = CLIPEncoder()
-    taxonomy = build_taxonomy()
-    encode_taxonomy(taxonomy, encoder)
-    _log(f"  {taxonomy.count()} concepts ready in {(time.perf_counter()-t0)*1000:.0f}ms")
+    detect_moe(keyframes[0][1])
+    _log(f"  Models ready in {(time.perf_counter()-t0)*1000:.0f}ms")
 
     _log("Analyzing keyframes...")
+    reset_tracker()
     timeline = []
-    prev_frame = None
-    skipped = 0
 
     for idx, (timestamp, frame) in enumerate(keyframes):
-        if prev_frame is not None and _frame_similarity(frame, prev_frame) > skip_similarity:
-            skipped += 1
-            continue
-        prev_frame = frame
-
-        regions = segment(frame)
-        if not regions:
-            continue
-        regions = merge_nearby_regions(frame, regions)
-
-        region_images = [extract_region_image(frame, r) for r in regions]
-        image_embeds = encoder.encode_images(region_images)
-
-        whole_embed = encoder.encode_images([frame])[0]
-
-        discoveries = discover_objects(
-            image_embeds, regions, taxonomy,
-            whole_image_embedding=whole_embed,
-            context_weight=0.3,
-            top_per_region=1,
-        )
+        t0 = time.perf_counter()
+        detections = detect_moe(frame)
+        ms = (time.perf_counter() - t0) * 1000
 
         frame_objects = []
-        for d in discoveries:
+        for d in detections:
             frame_objects.append({
                 "label": d.label,
                 "score": round(d.confidence, 3),
-                "path": d.path,
-                "region": d.region_index,
+                "source": d.source,
                 "bbox": d.bbox,
+                "scene_boosted": d.scene_boosted,
             })
 
         timeline.append(FrameResult(
             frame_idx=idx, timestamp=timestamp, objects=frame_objects
         ))
 
-        analyzed = idx + 1 - skipped
-        labels_str = ", ".join(d.label for d in discoveries[:5])
-        _log(f"  [{analyzed}/{len(keyframes)}] t={timestamp:.1f}s: "
-             f"{len(regions)} regions, {len(discoveries)} objects — {labels_str}")
+        labels_str = ", ".join(d.label for d in detections[:5])
+        _log(f"  [{idx+1}/{len(keyframes)}] t={timestamp:.1f}s ({ms:.0f}ms): {labels_str}")
 
     # Build object manifest
     objects: dict[str, dict] = {}
     for fr in timeline:
         for obj in fr.objects:
-            key = " > ".join(obj["path"])
-            if key not in objects:
-                objects[key] = {
-                    "label": obj["label"],
-                    "path": obj["path"],
+            label = obj["label"]
+            if label not in objects:
+                objects[label] = {
+                    "label": label,
                     "frames": [],
                     "timestamps": [],
                     "peak_score": 0.0,
+                    "sources": set(),
                     "first_seen": fr.timestamp,
                     "last_seen": fr.timestamp,
                 }
-            entry = objects[key]
+            entry = objects[label]
             entry["frames"].append(fr.frame_idx)
             entry["timestamps"].append(round(fr.timestamp, 2))
             entry["peak_score"] = max(entry["peak_score"], obj["score"])
+            entry["sources"].add(obj["source"])
             entry["last_seen"] = fr.timestamp
+
+    # Convert sets to lists for JSON
+    for entry in objects.values():
+        entry["sources"] = sorted(entry["sources"])
 
     objects = dict(sorted(objects.items(), key=lambda x: len(x[1]["frames"]), reverse=True))
 
     total_ms = (time.perf_counter() - t_total) * 1000
     _log(f"\nDone: {len(objects)} unique objects across {len(timeline)} frames in {total_ms/1000:.1f}s")
-    if skipped:
-        _log(f"  ({skipped} similar frames skipped)")
 
     return VideoManifest(
         video_path=video_path,
