@@ -1,4 +1,5 @@
-"""Hierarchical object discovery — walks the taxonomy tree per segment."""
+"""Hierarchical object discovery — walks the taxonomy tree per segment,
+using whole-image context to improve accuracy."""
 
 import numpy as np
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ def discover_objects(
     image_embeddings: np.ndarray,
     regions: list,
     taxonomy: TaxNode,
+    whole_image_embedding: np.ndarray | None = None,
+    context_weight: float = 0.3,
     beam_width: int = 2,
     min_score: float = 0.20,
     top_per_region: int = 1,
@@ -28,6 +31,10 @@ def discover_objects(
 
     for i, region in enumerate(regions):
         embed = image_embeddings[i]
+
+        if whole_image_embedding is not None:
+            embed = _blend(embed, whole_image_embedding, context_weight)
+
         paths = _walk_tree(embed, taxonomy, beam_width, min_score)
 
         region_dets = []
@@ -50,6 +57,12 @@ def discover_objects(
 
     all_discoveries.sort(key=lambda d: d.confidence, reverse=True)
     return all_discoveries
+
+
+def _blend(segment_embed: np.ndarray, context_embed: np.ndarray, weight: float) -> np.ndarray:
+    blended = (1 - weight) * segment_embed + weight * context_embed
+    blended = blended / np.linalg.norm(blended)
+    return blended
 
 
 def _walk_tree(

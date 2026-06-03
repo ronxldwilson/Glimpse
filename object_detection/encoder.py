@@ -13,7 +13,7 @@ PROMPT_TEMPLATES = [
 
 
 class CLIPEncoder:
-    def __init__(self, model_name: str = "ViT-B-32", pretrained: str = "laion2b_s34b_b79k"):
+    def __init__(self, model_name: str = "ViT-B-16", pretrained: str = "laion2b_s34b_b88k"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(
             model_name, pretrained=pretrained

@@ -199,7 +199,6 @@ def main():
     parser.add_argument("--fps", type=float, default=1.0, help="Frames per second (fixed mode)")
     parser.add_argument("--threshold", type=float, default=0.3, help="Scene change threshold")
     parser.add_argument("--max-frames", type=int, default=200, help="Max frames to analyze")
-    parser.add_argument("--score", type=float, default=0.22, help="Min detection score")
     args = parser.parse_args()
 
     manifest = analyze_video(
@@ -208,7 +207,6 @@ def main():
         scene_threshold=args.threshold,
         fixed_fps=args.fps,
         max_frames=args.max_frames,
-        score_threshold=args.score,
     )
 
     # Re-extract frames for thumbnails

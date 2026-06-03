@@ -13,7 +13,8 @@ import numpy as np
 
 from .segment import segment, merge_nearby_regions, extract_region_image
 from .encoder import CLIPEncoder
-from .vocab import load_cached, encode_and_cache
+from .taxonomy import build_taxonomy, encode_taxonomy
+from .discover import discover_objects
 
 
 @dataclass
@@ -29,7 +30,7 @@ class VideoManifest:
     duration: float
     total_frames: int
     keyframes_analyzed: int
-    objects: dict[str, dict]  # label -> {frames, first_seen, last_seen, peak_score, path}
+    objects: dict[str, dict]
     timeline: list[FrameResult]
     processing_time_ms: float
 
@@ -91,7 +92,6 @@ def _extract_scene_changes(
             ts = timestamps[i] if i < len(timestamps) else i
             frames.append((ts, img))
 
-        # Always include first frame
         if frames and frames[0][0] > 0.5:
             cap = cv2.VideoCapture(video_path)
             ret, first = cap.read()
@@ -144,13 +144,10 @@ def analyze_video(
     scene_threshold: float = 0.3,
     fixed_fps: float = 1.0,
     max_frames: int = 200,
-    top_k: int = 5,
-    score_threshold: float = 0.22,
     skip_similarity: float = 0.95,
 ) -> VideoManifest:
     t_total = time.perf_counter()
 
-    # Get video info
     cap = cv2.VideoCapture(video_path)
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -158,7 +155,6 @@ def analyze_video(
     cap.release()
     _log(f"Video: {duration:.1f}s, {total_frames} frames @ {video_fps:.0f}fps")
 
-    # Extract keyframes
     _log(f"Extracting keyframes (mode={mode})...")
     t0 = time.perf_counter()
     keyframes = extract_keyframes(video_path, mode, scene_threshold, fixed_fps, max_frames)
@@ -170,85 +166,68 @@ def analyze_video(
             keyframes_analyzed=0, objects={}, timeline=[], processing_time_ms=0,
         )
 
-    # Load CLIP + vocabulary
-    _log("Loading CLIP model...")
+    _log("Loading CLIP + building taxonomy...")
+    t0 = time.perf_counter()
     encoder = CLIPEncoder()
+    taxonomy = build_taxonomy()
+    encode_taxonomy(taxonomy, encoder)
+    _log(f"  {taxonomy.count()} concepts ready in {(time.perf_counter()-t0)*1000:.0f}ms")
 
-    cached = load_cached()
-    if cached:
-        vocab_labels, vocab_embeddings, vocab_paths = cached
-        _log(f"  Vocabulary: {len(vocab_labels)} labels from cache")
-    else:
-        _log("  No cached vocabulary, encoding...")
-        vocab_labels, vocab_embeddings = encode_and_cache(encoder)
-        vocab_paths = {}
-
-    # Process keyframes
     _log("Analyzing keyframes...")
     timeline = []
     prev_frame = None
     skipped = 0
 
     for idx, (timestamp, frame) in enumerate(keyframes):
-        # Skip if too similar to previous frame
         if prev_frame is not None and _frame_similarity(frame, prev_frame) > skip_similarity:
             skipped += 1
             continue
         prev_frame = frame
 
-        # Segment
         regions = segment(frame)
         if not regions:
             continue
         regions = merge_nearby_regions(frame, regions)
 
-        # Encode regions
         region_images = [extract_region_image(frame, r) for r in regions]
         image_embeds = encoder.encode_images(region_images)
 
-        # Match against vocabulary
-        similarity = image_embeds @ vocab_embeddings.T
+        whole_embed = encoder.encode_images([frame])[0]
+
+        discoveries = discover_objects(
+            image_embeds, regions, taxonomy,
+            whole_image_embedding=whole_embed,
+            context_weight=0.3,
+            top_per_region=1,
+        )
 
         frame_objects = []
-        seen_labels = set()
-        for ri in range(len(regions)):
-            scores = similarity[ri]
-            top_indices = np.argsort(scores)[::-1][:top_k]
-
-            for ti in top_indices:
-                score = float(scores[ti])
-                if score < score_threshold:
-                    continue
-                label = vocab_labels[ti]
-                if label in seen_labels:
-                    continue
-                seen_labels.add(label)
-
-                path = vocab_paths.get(label, [label])
-                frame_objects.append({
-                    "label": label,
-                    "score": round(score, 3),
-                    "path": path,
-                    "region": ri,
-                    "bbox": regions[ri].bbox,
-                })
+        for d in discoveries:
+            frame_objects.append({
+                "label": d.label,
+                "score": round(d.confidence, 3),
+                "path": d.path,
+                "region": d.region_index,
+                "bbox": d.bbox,
+            })
 
         timeline.append(FrameResult(
             frame_idx=idx, timestamp=timestamp, objects=frame_objects
         ))
 
         analyzed = idx + 1 - skipped
+        labels_str = ", ".join(d.label for d in discoveries[:5])
         _log(f"  [{analyzed}/{len(keyframes)}] t={timestamp:.1f}s: "
-             f"{len(regions)} regions, {len(frame_objects)} objects")
+             f"{len(regions)} regions, {len(discoveries)} objects — {labels_str}")
 
     # Build object manifest
     objects: dict[str, dict] = {}
     for fr in timeline:
         for obj in fr.objects:
-            label = obj["label"]
-            if label not in objects:
-                objects[label] = {
-                    "label": label,
+            key = " > ".join(obj["path"])
+            if key not in objects:
+                objects[key] = {
+                    "label": obj["label"],
                     "path": obj["path"],
                     "frames": [],
                     "timestamps": [],
@@ -256,17 +235,16 @@ def analyze_video(
                     "first_seen": fr.timestamp,
                     "last_seen": fr.timestamp,
                 }
-            entry = objects[label]
+            entry = objects[key]
             entry["frames"].append(fr.frame_idx)
             entry["timestamps"].append(round(fr.timestamp, 2))
             entry["peak_score"] = max(entry["peak_score"], obj["score"])
             entry["last_seen"] = fr.timestamp
 
-    # Sort by number of appearances
     objects = dict(sorted(objects.items(), key=lambda x: len(x[1]["frames"]), reverse=True))
 
     total_ms = (time.perf_counter() - t_total) * 1000
-    _log(f"\nDone: {len(objects)} unique objects found across {len(timeline)} frames in {total_ms/1000:.1f}s")
+    _log(f"\nDone: {len(objects)} unique objects across {len(timeline)} frames in {total_ms/1000:.1f}s")
     if skipped:
         _log(f"  ({skipped} similar frames skipped)")
 

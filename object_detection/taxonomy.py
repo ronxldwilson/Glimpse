@@ -2,6 +2,7 @@
 
 import numpy as np
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from nltk.corpus import wordnet as wn
 
@@ -274,10 +275,28 @@ def _expand_from_wordnet(node: TaxNode, synset, spec: dict):
             node.children.append(TaxNode(name=name, synset=syn_id))
 
 
+CACHE_DIR = Path(__file__).parent.parent / "models"
+
+
 def encode_taxonomy(root: TaxNode, encoder) -> None:
+    cache_path = CACHE_DIR / "taxonomy_embeddings.npy"
     all_names = root.all_names()
+
+    if cache_path.exists():
+        all_embeddings = np.load(cache_path)
+        if len(all_embeddings) == len(all_names):
+            _assign_embeddings(root, all_embeddings)
+            return
+
     all_embeddings = encoder.encode_labels(all_names)
 
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, all_embeddings)
+
+    _assign_embeddings(root, all_embeddings)
+
+
+def _assign_embeddings(root: TaxNode, all_embeddings: np.ndarray) -> None:
     idx = [0]
 
     def _assign(node):
