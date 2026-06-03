@@ -2,23 +2,27 @@
 
 Zero-shot object discovery for images and video. No labels, no training, no cloud APIs.
 
-Glimpse segments an image into objects using [FastSAM](https://github.com/CASIA-IVA-Lab/FastSAM), identifies each object by walking a 27,000-concept vocabulary built from [WordNet](https://wordnet.princeton.edu/) using [CLIP](https://github.com/mlfoundations/open_clip) similarity, and produces structured manifests of everything it finds.
+Glimpse uses a **Mixture of Experts** (MoE) approach — combining YOLO-World, CLIP, scene classification, and temporal tracking — to detect and identify objects in any image or video. It produces structured manifests with bounding boxes, confidence scores, and object timelines.
 
 ## What it does
 
-Give Glimpse any image or video. It tells you what's in it.
+Give Glimpse any video. It tells you what's in it, where, and when.
 
 ```
-$ discover photo.jpg
-electronics > headphones  [0.281 > 0.331]
-electronics > smartphone  [0.254 > 0.303]
-accessory > watch > smartwatch  [0.250 > 0.264 > 0.281]
-food > vegetable > bell pepper  [0.249 > 0.288 > 0.328]
-person > woman  [0.271 > 0.265]
-kitchen item > cookware > pot  [0.228 > 0.236 > 0.251]
+$ analyze-video cooking.mp4 --output report.html
+
+Video: 30.0s, 750 frames @ 25fps
+Extracting keyframes (mode=scene)...
+  11 keyframes in 150ms
+Analyzing keyframes...
+  [6/11] t=16.3s: cutting board, counter, man, woman, sink
+  [8/11] t=22.7s: man, saucepan, window, pan, wok
+  [9/11] t=23.4s: table, lemon, apple, apple, onion
+
+Done: 22 unique objects across 11 frames in 15.7s
 ```
 
-No labels provided. The system discovers objects by navigating a taxonomy tree top-down — broad category first, then narrowing to the specific object. Each step is a CLIP similarity lookup against pre-encoded embeddings.
+The HTML report includes an interactive timeline — click any keyframe to see the full-res image with **bounding boxes** drawn around every detected object.
 
 ## How it works
 
@@ -26,32 +30,36 @@ No labels provided. The system discovers objects by navigating a taxonomy tree t
 Image/Video
     |
     v
-[FastSAM] -- YOLO-based segmentation, ~160ms/image
+[ffmpeg scene detection] ── extract keyframes where content changes
     |
     v
-[Isolate regions on white background] -- cleaner CLIP signal
+[MoE Detection] ── four experts work together per frame:
+    |
+    |── Expert 1: YOLO-World ──── fast object detection with bboxes (~63ms)
+    |── Expert 2: FastSAM+CLIP ── segment → isolate → classify rare objects (~800ms)
+    |── Expert 3: Scene context ── "kitchen" boosts cookware scores (+60ms)
+    |── Expert 4: Temporal track ─ carry detections across similar frames (+3ms)
     |
     v
-[CLIP ViT-B-16 encode each region] -- batch encode, ~50ms/region
+[Merge + Filter] ── YOLO names common objects, CLIP catches what YOLO misses,
+                     scene context boosts relevant labels, confidence filtering
     |
     v
-[Walk 335-concept taxonomy tree] -- hierarchical narrowing, <1ms
-    |
-    v
-Structured output: object labels, taxonomy paths, bounding boxes, timestamps
+Structured output: object labels, bounding boxes, confidence, source, timestamps
 ```
 
-### Key ideas
+### Mixture of Experts strategy
 
-- **Segment first, classify second** — FastSAM finds object boundaries without knowing what they are, then CLIP identifies each isolated region. This beats whole-image CLIP which dilutes the embedding when multiple objects are present.
+Each expert has a strength:
 
-- **White background isolation** — each segment is placed on a white background before CLIP encoding. This aligns with CLIP's training distribution (product photos, stock images) and measurably improves scores.
+| Expert | Speed | Strength | Weakness |
+|--------|-------|----------|----------|
+| **YOLO-World** | 63ms | Precise bboxes, high confidence on common objects | Limited vocabulary |
+| **CLIP taxonomy** | 800ms | 1,060 concepts, catches rare objects (onion, wok) | Lower confidence, some noise |
+| **Scene classifier** | 60ms | Contextual reweighting (kitchen → boost cookware) | Indirect |
+| **Temporal tracker** | 3ms | Carries detections across similar frames | Only helps video |
 
-- **Prompt-engineered CLIP** — instead of encoding bare labels ("laptop"), each concept is encoded as the average of 5 prompt templates ("a photo of a laptop", "a close-up photo of a laptop", etc.) for better score separation.
-
-- **Hierarchical discovery** — instead of flat top-k matching against 27K labels, the system can walk a curated taxonomy tree (electronics > audio > headphones) using beam search at each level.
-
-- **Pre-encoded vocabulary** — the 27K-label vocabulary is encoded once and cached to disk (~55MB). At runtime, matching is just a matrix multiply — near instant.
+When both YOLO and CLIP detect the same region, YOLO's label wins if confident (it's more precise). CLIP's label wins when YOLO misses the object entirely. Scene context adds a +0.05 confidence boost to labels that match the detected scene type.
 
 ## Installation
 
@@ -61,10 +69,11 @@ cd Glimpse
 uv venv && uv pip install -e ".[dev]"
 ```
 
-Download the FastSAM weights:
+Download model weights:
 ```bash
 mkdir -p models
 curl -L https://github.com/ultralytics/assets/releases/download/v8.4.0/FastSAM-s.pt -o models/FastSAM-s.pt
+curl -L https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt -o models/yolov8s-worldv2.pt
 ```
 
 Download WordNet data:
@@ -72,10 +81,7 @@ Download WordNet data:
 uv run python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
 ```
 
-Build the vocabulary (one-time, ~2 min):
-```bash
-uv run python encode_vocab.py
-```
+The CLIP ViT-B-16 weights and taxonomy embeddings are downloaded/cached automatically on first run.
 
 ### Docker
 
@@ -83,43 +89,21 @@ uv run python encode_vocab.py
 docker compose build
 ```
 
-Build the vocabulary (one-time):
-```bash
-docker compose run glimpse object_detection.vocab
-```
-
-Discover objects:
-```bash
-docker compose run glimpse object_detection.demo_discover /data/image.jpg --output /data/report.html
-```
-
-Analyze video:
+Analyze a video:
 ```bash
 docker compose run glimpse object_detection.demo_video /data/video.mp4 --output /data/report.html
 ```
 
-Place your images/videos in the `data/` directory — it's mounted into the container.
+Discover objects in images:
+```bash
+docker compose run glimpse object_detection.demo_discover /data/image.jpg --output /data/report.html
+```
+
+Place your files in the `data/` directory — it's mounted into the container.
 
 ## Usage
 
-### Discover objects in images (no labels needed)
-
-```bash
-discover image1.jpg image2.jpg --output report.html
-```
-
-Generates an HTML report with:
-- Segmentation overlay
-- Per-region identification with taxonomy paths
-- Confidence scores at each level
-
-### Detect specific objects
-
-```bash
-detect-demo image.jpg --labels laptop headphones phone desk --output demo.html
-```
-
-### Analyze a video
+### Analyze a video (MoE pipeline)
 
 ```bash
 analyze-video video.mp4 --output report.html
@@ -133,66 +117,87 @@ Options:
 --max-frames 200      Maximum frames to analyze
 ```
 
-The video pipeline:
-1. Extracts keyframes using ffmpeg scene detection (only frames where something changes)
-2. Skips visually similar frames automatically
-3. Segments and identifies objects in each keyframe
-4. Produces a manifest: which objects appear, when, and for how long
+The HTML report includes:
+- Sidebar with all detected objects, sorted by frequency
+- Interactive timeline of keyframes
+- Click any frame to see full-res image with **bounding boxes**
+- Per-detection confidence scores and source tags (yolo/clip/both)
+
+### Discover objects in images
+
+```bash
+discover image1.jpg image2.jpg --output report.html
+```
+
+Uses the CLIP taxonomy for hierarchical discovery — no labels needed.
+
+### Detect specific objects
+
+```bash
+detect-demo image.jpg --labels laptop headphones phone desk --output demo.html
+```
 
 ## Performance
 
 All benchmarks on Apple M-series CPU, no GPU.
 
-| Step | Time |
-|------|------|
-| FastSAM segmentation | ~160ms/image |
-| CLIP ViT-B-16 region encoding | ~50ms/region |
-| Taxonomy tree walk (335 concepts) | <1ms |
-| **Typical image (15 regions)** | **~1s** |
+| Component | Time |
+|-----------|------|
+| YOLO-World detection | ~63ms/frame |
+| FastSAM segmentation | ~160ms/frame |
+| CLIP ViT-B-16 encoding | ~50ms/region |
+| Scene classification | ~60ms/frame |
+| Temporal tracking | ~3ms/frame |
+| **MoE total per frame** | **~800ms** |
 
-| Video (scene detection) | Time |
-|---|---|
-| 30s video (10 keyframes) | ~10s |
-| 1 min video (~20 keyframes) | ~20s |
-| 5 min video (~50 keyframes) | ~1 min |
+| Video | Keyframes | Processing Time |
+|-------|-----------|-----------------|
+| 30s cooking video | 11 | **16s** |
+| 2 min street video | 50 | **90s** |
 
-Taxonomy encoding is a one-time cost (~25s, cached to disk). Model loading is a one-time cost per session (~3s).
+Taxonomy encoding is a one-time cost (~25s, cached to disk). Model loading is ~6s per session.
 
 ## Architecture
 
 ```
 object_detection/
+  moe.py            -- Mixture of Experts: YOLO + CLIP + scene + tracking
   segment.py        -- FastSAM segmentation, region merging
-  encoder.py        -- CLIP encoding with prompt templates
-  detector.py       -- Label-based detection (user provides labels)
-  taxonomy.py       -- WordNet taxonomy builder (335 curated nodes)
-  vocab.py          -- 27K vocabulary builder with incremental encoding
+  encoder.py        -- CLIP ViT-B-16 with prompt templates
+  taxonomy.py       -- WordNet taxonomy (1,060 nodes, auto-expanded)
   discover.py       -- Hierarchical tree-walk discovery
-  video.py          -- Video analysis pipeline (ffmpeg + per-frame analysis)
-  demo.py           -- Multi-image HTML report generator
-  demo_discover.py  -- Discovery HTML report generator
-  demo_video.py     -- Video HTML report generator
+  video.py          -- Video pipeline (ffmpeg keyframes + MoE per frame)
+  detector.py       -- Simple label-based detection
+  demo.py           -- Multi-image HTML report
+  demo_discover.py  -- Discovery HTML report
+  demo_video.py     -- Video HTML report with bbox overlays
+  vocab.py          -- Large vocabulary builder (optional)
   cli.py            -- CLI entry points
 ```
 
-## How the taxonomy works
+## How the MoE taxonomy works
 
-Glimpse uses a curated 335-concept taxonomy built from WordNet, organized into 18 visual categories (electronics, furniture, food, clothing, vehicle, etc.) with 2-3 levels of specificity.
+Glimpse uses a curated taxonomy built from WordNet, organized into 18 visual categories with auto-expanded leaves (~1,060 total concepts):
 
-On first run:
-1. Builds the taxonomy tree from curated WordNet synsets
-2. Encodes each concept with CLIP ViT-B-16 using 5 prompt templates
-3. Caches embeddings to disk (`models/taxonomy_embeddings.npy`, ~670KB)
+```
+object
+├── person (man, woman, child, baby)
+├── electronics (laptop, smartphone, headphones, camera, ...)
+├── furniture (chair, table, desk, sofa, bed, shelf, ...)
+├── food
+│   ├── fruit (apple, banana, orange, ...)
+│   ├── vegetable (onion, tomato, carrot, ...)
+│   └── ...
+├── kitchen item
+│   ├── cookware (pot, pan, wok, saucepan, ...)
+│   ├── utensil (knife, spatula, ladle, ...)
+│   └── appliance (oven, microwave, stove, ...)
+├── vehicle (car, truck, bus, bicycle, ...)
+├── clothing (shirt, jacket, hat, shoes, ...)
+└── ... (18 categories total)
+```
 
-At runtime, identifying an object is a **hierarchical tree walk**:
-1. Score the segment against all 18 top-level categories
-2. Take the top 2 (beam search), descend into their children
-3. Repeat until reaching leaf nodes
-4. Return the deepest, highest-scoring path
-
-Example: `electronics > headphones`, `food > vegetable > bell pepper`, `kitchen item > cookware > pot`
-
-This hierarchical approach is more accurate than flat vocabulary matching because each level only has 5-15 meaningfully different choices, making CLIP's similarity scores more discriminative.
+At runtime, identifying an object is a **hierarchical tree walk**: score against top-level categories, descend into the best match, repeat. This is more accurate than flat vocabulary matching because each branching point only has 5-15 choices.
 
 ## License
 

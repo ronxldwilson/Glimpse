@@ -1,4 +1,4 @@
-"""HTML report for video object analysis."""
+"""HTML report for video object analysis with bounding box overlays."""
 
 import argparse
 import base64
@@ -40,11 +40,11 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
   <div class="obj-bar"><div class="obj-bar-fill" style="width:{bar_pct:.0f}%"></div></div>
 </div>"""
 
-    # Build timeline frames
+    # Build timeline thumbs
     timeline_html = ""
     for i, fr in enumerate(s.timeline):
         if i < len(keyframes):
-            thumb_uri = image_to_data_uri(keyframes[i], quality=50)
+            thumb_uri = image_to_data_uri(keyframes[i], quality=40)
         else:
             thumb_uri = ""
 
@@ -61,18 +61,39 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
   </div>
 </div>"""
 
-    # Build frame detail panels (hidden, shown on click)
+    # Full-res frame images for bbox overlay
+    frame_images_json = "{"
+    for i in range(len(s.timeline)):
+        if i < len(keyframes):
+            uri = image_to_data_uri(keyframes[i], quality=80)
+            frame_images_json += f'{i}:"{uri}",'
+    frame_images_json += "}"
+
+    # Frame data with bboxes + image dimensions
     frames_json_items = []
     for i, fr in enumerate(s.timeline):
-        objs = [{"label": o["label"], "score": o["score"],
-                 "source": o.get("source", ""),
-                 "path": o["label"]}
-                for o in fr.objects[:15]]
+        img_h, img_w = 0, 0
+        if i < len(keyframes):
+            img_h, img_w = keyframes[i].shape[:2]
+
+        objs = []
+        for o in fr.objects[:20]:
+            bbox = o.get("bbox", None)
+            objs.append({
+                "label": o["label"],
+                "score": o["score"],
+                "source": o.get("source", ""),
+                "bbox": list(bbox) if bbox else None,
+            })
         frames_json_items.append({
             "timestamp": round(fr.timestamp, 2),
             "objects": objs,
+            "width": img_w,
+            "height": img_h,
         })
-    frames_json = str(frames_json_items).replace("'", '"')
+    frames_json = str(frames_json_items).replace("'", '"').replace("None", "null").replace("True", "true").replace("False", "false")
+
+    colors_js = '["#4fc3f7","#81c784","#ffb74d","#f06292","#9575cd","#4dd0e1","#ff8a65","#aed581","#ffd54f","#90a4ae"]'
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -99,7 +120,6 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
 
   .obj-card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 8px 10px; margin-bottom: 5px; }}
   .obj-name {{ font-weight: 600; font-size: 0.85rem; color: #4fc3f7; }}
-  .obj-path {{ font-size: 0.65rem; color: #666; margin-bottom: 4px; }}
   .obj-stats {{ display: flex; gap: 8px; font-size: 0.7rem; color: #888; margin-bottom: 4px; }}
   .obj-frames {{ color: #aaa; }}
   .obj-score {{ color: #4fc3f7; }}
@@ -109,24 +129,29 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
 
   .main {{ flex: 1; padding: 24px; overflow-y: auto; }}
 
-  .tl-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }}
+  .frame-viewer {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: none; }}
+  .frame-viewer.active {{ display: block; }}
+  .frame-viewer h3 {{ font-size: 0.9rem; margin-bottom: 12px; color: #4fc3f7; }}
+  .frame-canvas-wrap {{ position: relative; display: inline-block; max-width: 100%; }}
+  .frame-canvas-wrap img {{ max-width: 100%; border-radius: 4px; display: block; }}
+  .frame-canvas-wrap canvas {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }}
+
+  .frame-det-list {{ margin-top: 12px; }}
+  .frame-det {{ font-size: 0.8rem; padding: 4px 8px; margin-bottom: 3px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }}
+  .frame-det-label {{ font-weight: 500; }}
+  .frame-det-source {{ font-size: 0.65rem; color: #666; margin-left: 6px; }}
+  .frame-det-score {{ color: #4fc3f7; font-size: 0.8rem; }}
+  .frame-det-dot {{ width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }}
+
+  .tl-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }}
   .tl-frame {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; overflow: hidden; cursor: pointer; transition: border-color 0.15s; }}
   .tl-frame:hover {{ border-color: #4fc3f7; }}
   .tl-frame.active {{ border-color: #4fc3f7; box-shadow: 0 0 0 1px #4fc3f7; }}
   .tl-frame img {{ width: 100%; aspect-ratio: 16/9; object-fit: cover; }}
-  .tl-info {{ padding: 8px 10px; }}
-  .tl-time {{ font-weight: 600; font-size: 0.85rem; color: #4fc3f7; }}
-  .tl-objects {{ font-size: 0.7rem; color: #888; }}
-  .tl-labels {{ font-size: 0.7rem; color: #aaa; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-
-  .frame-detail {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 20px; display: none; }}
-  .frame-detail.active {{ display: block; }}
-  .frame-detail h3 {{ font-size: 0.9rem; margin-bottom: 10px; color: #4fc3f7; }}
-  .frame-det {{ font-size: 0.8rem; padding: 4px 0; border-bottom: 1px solid #222; display: flex; justify-content: space-between; }}
-  .frame-det:last-child {{ border: none; }}
-  .frame-det-label {{ color: #e0e0e0; }}
-  .frame-det-score {{ color: #4fc3f7; }}
-  .frame-det-path {{ color: #666; font-size: 0.7rem; }}
+  .tl-info {{ padding: 6px 8px; }}
+  .tl-time {{ font-weight: 600; font-size: 0.8rem; color: #4fc3f7; }}
+  .tl-objects {{ font-size: 0.65rem; color: #888; }}
+  .tl-labels {{ font-size: 0.65rem; color: #aaa; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 </style>
 </head>
 <body>
@@ -148,9 +173,13 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
 </div>
 
 <div class="main">
-  <div class="frame-detail" id="frame-detail">
-    <h3 id="detail-title">Click a frame to see details</h3>
-    <div id="detail-objects"></div>
+  <div class="frame-viewer" id="frame-viewer">
+    <h3 id="viewer-title">Click a frame to see detections</h3>
+    <div class="frame-canvas-wrap">
+      <img id="viewer-img" src="">
+      <canvas id="viewer-canvas"></canvas>
+    </div>
+    <div class="frame-det-list" id="viewer-dets"></div>
   </div>
 
   <div class="section-title" style="margin-bottom:12px;">Timeline ({s.keyframes_analyzed} keyframes)</div>
@@ -163,25 +192,72 @@ def generate_html(manifest: VideoManifest, keyframes: list, output_path: str):
 
 <script>
 const frameData = {frames_json};
+const frameImages = {frame_images_json};
+const COLORS = {colors_js};
 
 function showFrame(idx) {{
   document.querySelectorAll('.tl-frame').forEach((f, i) => f.classList.toggle('active', i === idx));
 
-  const detail = document.getElementById('frame-detail');
-  const title = document.getElementById('detail-title');
-  const objs = document.getElementById('detail-objects');
-  detail.classList.add('active');
+  const viewer = document.getElementById('frame-viewer');
+  const title = document.getElementById('viewer-title');
+  const img = document.getElementById('viewer-img');
+  const canvas = document.getElementById('viewer-canvas');
+  const dets = document.getElementById('viewer-dets');
+
+  viewer.classList.add('active');
 
   const f = frameData[idx];
   title.textContent = 'Frame at ' + f.timestamp + 's — ' + f.objects.length + ' objects';
 
-  objs.innerHTML = f.objects.map(o =>
-    '<div class="frame-det">' +
-      '<div><span class="frame-det-label">' + o.label + '</span> ' +
-      '<span class="frame-det-path">' + (o.source || '') + '</span></div>' +
+  if (frameImages[idx]) {{
+    img.src = frameImages[idx];
+    img.onload = function() {{
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      drawBoxes(canvas, f, img.naturalWidth, img.naturalHeight);
+    }};
+  }}
+
+  let detHtml = '';
+  f.objects.forEach((o, i) => {{
+    const color = COLORS[i % COLORS.length];
+    detHtml += '<div class="frame-det" style="border-left:3px solid ' + color + '">' +
+      '<div style="display:flex;align-items:center">' +
+        '<span class="frame-det-label">' + o.label + '</span>' +
+        '<span class="frame-det-source">' + (o.source || '') + '</span>' +
+      '</div>' +
       '<span class="frame-det-score">' + o.score.toFixed(3) + '</span>' +
-    '</div>'
-  ).join('') || '<div class="frame-det" style="color:#666">No objects detected</div>';
+    '</div>';
+  }});
+  dets.innerHTML = detHtml || '<div style="color:#666;font-size:0.8rem;">No objects detected</div>';
+
+  viewer.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+}}
+
+function drawBoxes(canvas, frame, imgW, imgH) {{
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  frame.objects.forEach((o, i) => {{
+    if (!o.bbox) return;
+    const [x, y, w, h] = o.bbox;
+    const color = COLORS[i % COLORS.length];
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, w, h);
+
+    const label = o.label + ' ' + o.score.toFixed(2);
+    ctx.font = 'bold 14px -apple-system, sans-serif';
+    const tm = ctx.measureText(label);
+    const lh = 20;
+
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y - lh, tm.width + 8, lh);
+
+    ctx.fillStyle = '#000';
+    ctx.fillText(label, x + 4, y - 5);
+  }});
 }}
 </script>
 </body>
@@ -211,7 +287,6 @@ def main():
         max_frames=args.max_frames,
     )
 
-    # Re-extract frames for thumbnails
     from .video import extract_keyframes
     keyframes_raw = extract_keyframes(
         args.video, args.mode, args.threshold, args.fps, args.max_frames

@@ -220,12 +220,15 @@ TAXONOMY_SPEC = {
 }
 
 
-def build_taxonomy() -> TaxNode:
+def build_taxonomy(expand: bool = True) -> TaxNode:
     root = TaxNode(name="object")
 
     for name, spec in TAXONOMY_SPEC.items():
         child = _build_from_spec(name, spec)
         root.children.append(child)
+
+    if expand:
+        auto_expand_leaves(root, max_depth=1, max_children=5)
 
     return root
 
@@ -275,6 +278,73 @@ def _expand_from_wordnet(node: TaxNode, synset, spec: dict):
             node.children.append(TaxNode(name=name, synset=syn_id))
 
 
+SKIP_EXPANSIONS = {
+    "person", "man", "woman", "child", "baby",
+    "wall", "floor", "ceiling", "door", "window", "stairs", "pillar",
+}
+
+
+def auto_expand_leaves(root: TaxNode, max_depth: int = 2, max_children: int = 10):
+    _expand_node(root, 0, max_depth, max_children)
+    return root
+
+
+def _expand_node(node: TaxNode, depth: int, max_depth: int, max_children: int):
+    for child in node.children:
+        _expand_node(child, depth, max_depth, max_children)
+
+    if not node.is_leaf():
+        return
+    if node.name in SKIP_EXPANSIONS:
+        return
+    if not node.synset:
+        synsets = wn.synsets(node.name.replace(" ", "_"), pos=wn.NOUN)
+        if not synsets:
+            return
+        node.synset = synsets[0].name()
+
+    try:
+        syn = wn.synset(node.synset)
+    except Exception:
+        return
+
+    _add_hyponyms(node, syn, 0, max_depth, max_children)
+
+
+def _add_hyponyms(node: TaxNode, synset, depth: int, max_depth: int, max_children: int):
+    if depth >= max_depth:
+        return
+
+    hyps = synset.hyponyms()
+    if not hyps:
+        return
+
+    candidates = []
+    for h in hyps:
+        name = h.lemmas()[0].name().replace("_", " ")
+        if len(name) < 3 or len(name) > 25:
+            continue
+        if any(c.isupper() for c in name[1:]):
+            continue
+        n_desc = len(h.hyponyms())
+        candidates.append((name, h, n_desc))
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    existing = {c.name for c in node.children}
+
+    added = 0
+    for name, h_syn, _ in candidates:
+        if added >= max_children:
+            break
+        if name in existing or name == node.name:
+            continue
+
+        child = TaxNode(name=name, synset=h_syn.name())
+        _add_hyponyms(child, h_syn, depth + 1, max_depth, max_children)
+        node.children.append(child)
+        added += 1
+
+
 CACHE_DIR = Path(__file__).parent.parent / "models"
 
 
@@ -288,7 +358,11 @@ def encode_taxonomy(root: TaxNode, encoder) -> None:
             _assign_embeddings(root, all_embeddings)
             return
 
-    all_embeddings = encoder.encode_labels(all_names)
+    batch_size = 200
+    chunks = []
+    for i in range(0, len(all_names), batch_size):
+        chunks.append(encoder.encode_labels(all_names[i:i + batch_size]))
+    all_embeddings = np.vstack(chunks)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     np.save(cache_path, all_embeddings)
