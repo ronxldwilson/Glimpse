@@ -1,0 +1,18 @@
+[project]
+name = "object-detection"
+version = "0.1.0"
+description = "SLIC superpixel segmentation + CLIP for multi-object detection"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "open-clip-torch>=2.24",
+    "torch>=2.0",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ipython"]
+
+[project.scripts]
+detect = "object_detection.cli:main"
