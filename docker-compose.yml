@@ -5,3 +5,17 @@ services:
       - ./models:/app/models
       - ./data:/data
     entrypoint: ["python", "-m"]
+
+  # One-shot: build the taxonomy cache
+  encode-taxonomy:
+    build: .
+    volumes:
+      - ./models:/app/models
+    command: ["object_detection.demo_discover", "--help"]
+    entrypoint: >
+      python -c "
+      from object_detection.encoder import CLIPEncoder;
+      from object_detection.taxonomy import build_taxonomy, encode_taxonomy;
+      e = CLIPEncoder(); t = build_taxonomy(); encode_taxonomy(t, e);
+      print(f'Cached {t.count()} concepts')
+      "

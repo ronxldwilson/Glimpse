@@ -21,7 +21,10 @@ RUN mkdir -p models && \
 
 RUN python -c "import nltk; nltk.download('wordnet', quiet=True); nltk.download('omw-1.4', quiet=True)"
 
-COPY encode_vocab.py .
+# Pre-download ViT-B-16 CLIP weights during build
+RUN python -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-16', pretrained='laion2b_s34b_b88k')"
+
+COPY encode_vocab.py encode_objects.py ./
 
 VOLUME ["/app/models", "/data"]
 

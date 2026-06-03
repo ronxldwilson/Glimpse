@@ -32,10 +32,10 @@ Image/Video
 [Isolate regions on white background] -- cleaner CLIP signal
     |
     v
-[CLIP encode each region] -- batch encode, ~15ms/region
+[CLIP ViT-B-16 encode each region] -- batch encode, ~50ms/region
     |
     v
-[Match against 27K WordNet vocabulary] -- single matrix multiply, <1ms
+[Walk 335-concept taxonomy tree] -- hierarchical narrowing, <1ms
     |
     v
 Structured output: object labels, taxonomy paths, bounding boxes, timestamps
@@ -131,7 +131,6 @@ Options:
 --fps 1.0             Frames per second (fixed mode)
 --threshold 0.3       Scene change sensitivity
 --max-frames 200      Maximum frames to analyze
---score 0.22          Minimum detection score
 ```
 
 The video pipeline:
@@ -147,17 +146,17 @@ All benchmarks on Apple M-series CPU, no GPU.
 | Step | Time |
 |------|------|
 | FastSAM segmentation | ~160ms/image |
-| CLIP region encoding | ~15ms/region |
-| Vocabulary matching (27K labels) | <1ms |
-| **Typical image (15 regions)** | **~400ms** |
+| CLIP ViT-B-16 region encoding | ~50ms/region |
+| Taxonomy tree walk (335 concepts) | <1ms |
+| **Typical image (15 regions)** | **~1s** |
 
-| Video (1fps sampling) | Time |
+| Video (scene detection) | Time |
 |---|---|
-| 30s video | ~12s |
-| 1 min video | ~24s |
-| 5 min video | ~2 min |
+| 30s video (10 keyframes) | ~10s |
+| 1 min video (~20 keyframes) | ~20s |
+| 5 min video (~50 keyframes) | ~1 min |
 
-Vocabulary encoding is a one-time cost (~2 min). Model loading is a one-time cost per session (~2.5s).
+Taxonomy encoding is a one-time cost (~25s, cached to disk). Model loading is a one-time cost per session (~3s).
 
 ## Architecture
 
@@ -176,18 +175,24 @@ object_detection/
   cli.py            -- CLI entry points
 ```
 
-## How the vocabulary works
+## How the taxonomy works
 
-On first run, Glimpse builds a vocabulary from WordNet:
+Glimpse uses a curated 335-concept taxonomy built from WordNet, organized into 18 visual categories (electronics, furniture, food, clothing, vehicle, etc.) with 2-3 levels of specificity.
 
-1. Traverses WordNet's noun hierarchy under visual anchors (artifact, animal, food, clothing, vehicle, etc.)
-2. Filters for visually recognizable concepts (~27K nouns)
-3. Encodes each with CLIP using 5 prompt templates and averages the embeddings
-4. Saves to disk (`models/vocab_embeddings.npy`, ~55MB)
+On first run:
+1. Builds the taxonomy tree from curated WordNet synsets
+2. Encodes each concept with CLIP ViT-B-16 using 5 prompt templates
+3. Caches embeddings to disk (`models/taxonomy_embeddings.npy`, ~670KB)
 
-At runtime, identifying an object is a single matrix multiply: region embedding (512-dim) dot product against all 27K vocabulary embeddings. The top-k results are the identification.
+At runtime, identifying an object is a **hierarchical tree walk**:
+1. Score the segment against all 18 top-level categories
+2. Take the top 2 (beam search), descend into their children
+3. Repeat until reaching leaf nodes
+4. Return the deepest, highest-scoring path
 
-The vocabulary also stores WordNet hypernym paths, so every identification comes with a full taxonomy: `entity > physical entity > object > artifact > instrumentality > device > electronic equipment > headphones`.
+Example: `electronics > headphones`, `food > vegetable > bell pepper`, `kitchen item > cookware > pot`
+
+This hierarchical approach is more accurate than flat vocabulary matching because each level only has 5-15 meaningfully different choices, making CLIP's similarity scores more discriminative.
 
 ## License
 

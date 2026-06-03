@@ -1,7 +1,7 @@
 [project]
 name = "object-detection"
 version = "0.1.0"
-description = "SLIC superpixel segmentation + CLIP for multi-object detection"
+description = "Zero-shot object discovery for images and video using FastSAM + CLIP + WordNet"
 requires-python = ">=3.10"
 dependencies = [
     "opencv-contrib-python>=4.8",
