@@ -9,6 +9,8 @@ dependencies = [
     "torch>=2.0",
     "Pillow>=10.0",
     "numpy>=1.24",
+    "ultralytics>=8.0",
+    "nltk>=3.8",
 ]
 
 [tool.setuptools.packages.find]
@@ -20,3 +22,5 @@ dev = ["pytest", "ipython"]
 [project.scripts]
 detect = "object_detection.cli:main"
 detect-demo = "object_detection.demo:main"
+discover = "object_detection.demo_discover:main"
+analyze-video = "object_detection.demo_video:main"

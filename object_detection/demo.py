@@ -1,6 +1,7 @@
 import argparse
 import base64
 import json
+import os
 import time
 import sys
 
@@ -40,37 +41,26 @@ def draw_detections_overlay(image: np.ndarray, detections) -> np.ndarray:
     return vis
 
 
-def generate_html(image_path: str, labels: list[str], output_path: str):
+def process_image(image_path: str, labels: list[str], encoder: CLIPEncoder, text_embeds: np.ndarray):
     image = cv2.imread(image_path)
     if image is None:
-        print(f"Error: cannot read {image_path}")
-        sys.exit(1)
+        print(f"  Skipping {image_path}: cannot read")
+        return None
 
-    print("FastSAM segmenting...")
+    name = os.path.basename(image_path)
+    print(f"  [{name}] Segmenting...")
     t0 = time.perf_counter()
     raw_regions = segment(image)
     seg_ms = (time.perf_counter() - t0) * 1000
-    print(f"  {len(raw_regions)} raw regions in {seg_ms:.0f}ms")
 
-    print("Merging nearby regions...")
     regions = merge_nearby_regions(image, raw_regions)
-    print(f"  {len(regions)} total regions ({len(regions) - len(raw_regions)} merged)")
+    print(f"  [{name}] {len(raw_regions)} regions + {len(regions) - len(raw_regions)} merged in {seg_ms:.0f}ms")
 
-    print("Loading CLIP model...")
-    t0 = time.perf_counter()
-    encoder = CLIPEncoder()
-    model_ms = (time.perf_counter() - t0) * 1000
-    print(f"  Loaded in {model_ms:.0f}ms")
-
-    print("Encoding labels (prompt-engineered)...")
-    text_embeds = encoder.encode_labels(labels)
-
-    print("Encoding regions...")
+    print(f"  [{name}] Encoding {len(regions)} regions...")
     t0 = time.perf_counter()
     region_images = [extract_region_image(image, r) for r in regions]
     image_embeds = encoder.encode_images(region_images)
     encode_ms = (time.perf_counter() - t0) * 1000
-    print(f"  {len(regions)} regions encoded in {encode_ms:.0f}ms")
 
     similarity = image_embeds @ text_embeds.T
 
@@ -101,32 +91,97 @@ def generate_html(image_path: str, labels: list[str], output_path: str):
 
     final_detections = _nms_by_label(all_detections, iou_threshold=0.5)
 
-    original_uri = image_to_data_uri(image)
-    seg_overlay_uri = image_to_data_uri(draw_segmentation_overlay(image, regions))
-    det_overlay_uri = image_to_data_uri(draw_detections_overlay(image, final_detections))
-
-    stats = {
-        "image_size": f"{image.shape[1]}x{image.shape[0]}",
-        "num_regions": len(regions),
-        "segmentation_ms": round(seg_ms),
-        "encoding_ms": round(encode_ms),
-        "num_detections": len(final_detections),
-        "labels_searched": labels,
+    return {
+        "name": name,
+        "original_uri": image_to_data_uri(image),
+        "seg_uri": image_to_data_uri(draw_segmentation_overlay(image, regions)),
+        "det_uri": image_to_data_uri(draw_detections_overlay(image, final_detections)),
+        "regions": region_data,
+        "detections": [
+            {"label": d.label, "score": round(d.score, 3), "bbox": d.bbox, "region": d.region_index}
+            for d in final_detections
+        ],
+        "stats": {
+            "image_size": f"{image.shape[1]}x{image.shape[0]}",
+            "num_regions": len(regions),
+            "segmentation_ms": round(seg_ms),
+            "encoding_ms": round(encode_ms),
+            "num_detections": len(final_detections),
+        },
     }
 
-    detection_list = [
-        {"label": d.label, "score": round(d.score, 3), "bbox": d.bbox, "region": d.region_index}
-        for d in final_detections
-    ]
 
-    html = _build_html(original_uri, seg_overlay_uri, det_overlay_uri, region_data, detection_list, stats)
+def generate_html(image_paths: list[str], labels: list[str], output_path: str):
+    print("Loading CLIP model...")
+    t0 = time.perf_counter()
+    encoder = CLIPEncoder()
+    print(f"  Loaded in {(time.perf_counter() - t0) * 1000:.0f}ms")
 
+    print("Encoding labels...")
+    text_embeds = encoder.encode_labels(labels)
+
+    results = []
+    for path in image_paths:
+        r = process_image(path, labels, encoder, text_embeds)
+        if r:
+            results.append(r)
+
+    if not results:
+        print("No images processed.")
+        sys.exit(1)
+
+    html = _build_html(results, labels)
     with open(output_path, "w") as f:
         f.write(html)
     print(f"Saved demo to {output_path}")
 
 
-def _build_html(original_uri, seg_uri, det_uri, regions, detections, stats):
+def _build_html(results: list[dict], labels: list[str]):
+    nav_items = ""
+    pages = ""
+    for idx, r in enumerate(results):
+        active = "active" if idx == 0 else ""
+        nav_items += f'<div class="nav-item {active}" onclick="switchImage({idx})">{r["name"]}</div>\n'
+
+        det_html = "".join(_det_card_html(d) for d in r["detections"]) or '<p style="color:#666;">No detections above threshold.</p>'
+        region_html = "".join(_region_card_html(reg) for reg in r["regions"])
+        s = r["stats"]
+
+        pages += f"""
+<div class="page {active}" id="page-{idx}">
+  <div class="stats">
+    <div class="stat"><div class="stat-value">{s['image_size']}</div><div class="stat-label">Image Size</div></div>
+    <div class="stat"><div class="stat-value">{s['num_regions']}</div><div class="stat-label">Regions</div></div>
+    <div class="stat"><div class="stat-value">{s['segmentation_ms']}ms</div><div class="stat-label">Segmentation</div></div>
+    <div class="stat"><div class="stat-value">{s['encoding_ms']}ms</div><div class="stat-label">CLIP Encoding</div></div>
+    <div class="stat"><div class="stat-value">{s['num_detections']}</div><div class="stat-label">Detections</div></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab(this, {idx}, 0)">Original</div>
+    <div class="tab" onclick="switchTab(this, {idx}, 1)">Segments</div>
+    <div class="tab" onclick="switchTab(this, {idx}, 2)">Detections</div>
+  </div>
+  <div class="view active" id="view-{idx}-0"><img src="{r['original_uri']}"></div>
+  <div class="view" id="view-{idx}-1"><img src="{r['seg_uri']}"></div>
+  <div class="view" id="view-{idx}-2"><img src="{r['det_uri']}"></div>
+
+  <div class="detections">
+    <h2>Detections</h2>
+    {det_html}
+  </div>
+
+  <div class="regions">
+    <h2>All Regions (on white background)</h2>
+    <div class="region-grid">
+      {region_html}
+    </div>
+  </div>
+</div>
+"""
+
+    labels_html = "".join(f'<span class="label-chip">{l}</span>' for l in labels)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -135,81 +190,93 @@ def _build_html(original_uri, seg_uri, det_uri, regions, detections, stats):
 <title>Object Detection — FastSAM + CLIP</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 24px; }}
-  h1 {{ font-size: 1.5rem; font-weight: 600; margin-bottom: 8px; }}
-  h2 {{ font-size: 1.1rem; font-weight: 500; margin-bottom: 12px; color: #aaa; }}
-  .stats {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-  .stat {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px 16px; }}
-  .stat-value {{ font-size: 1.3rem; font-weight: 600; color: #4fc3f7; }}
-  .stat-label {{ font-size: 0.75rem; color: #888; margin-top: 2px; }}
-  .tabs {{ display: flex; gap: 4px; margin-bottom: 16px; }}
-  .tab {{ padding: 8px 16px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 0.85rem; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; }}
+
+  .layout {{ display: flex; min-height: 100vh; }}
+
+  .sidebar {{ width: 220px; background: #141414; border-right: 1px solid #2a2a2a; padding: 16px 0; flex-shrink: 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; }}
+  .sidebar h1 {{ font-size: 1rem; font-weight: 600; padding: 0 16px 4px; }}
+  .sidebar h2 {{ font-size: 0.75rem; font-weight: 400; color: #666; padding: 0 16px 12px; }}
+  .nav-item {{ padding: 10px 16px; cursor: pointer; font-size: 0.85rem; border-left: 3px solid transparent; transition: all 0.15s; }}
+  .nav-item:hover {{ background: #1a1a1a; }}
+  .nav-item.active {{ background: #1a2a3a; border-left-color: #4fc3f7; color: #4fc3f7; }}
+
+  .sidebar .labels-section {{ padding: 12px 16px; border-top: 1px solid #2a2a2a; margin-top: 12px; }}
+  .sidebar .labels-section h3 {{ font-size: 0.7rem; text-transform: uppercase; color: #555; margin-bottom: 8px; letter-spacing: 0.05em; }}
+
+  .main {{ flex: 1; padding: 24px; overflow-y: auto; }}
+
+  .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }}
+  .stat {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 10px 14px; }}
+  .stat-value {{ font-size: 1.2rem; font-weight: 600; color: #4fc3f7; }}
+  .stat-label {{ font-size: 0.7rem; color: #888; margin-top: 2px; }}
+
+  h2 {{ font-size: 1rem; font-weight: 500; margin-bottom: 12px; color: #aaa; }}
+
+  .tabs {{ display: flex; gap: 4px; margin-bottom: 12px; }}
+  .tab {{ padding: 7px 14px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 0.8rem; }}
   .tab.active {{ background: #2a2a2a; border-bottom-color: #2a2a2a; color: #4fc3f7; }}
-  .view {{ display: none; background: #2a2a2a; border-radius: 0 8px 8px 8px; padding: 16px; }}
+  .view {{ display: none; background: #2a2a2a; border-radius: 0 8px 8px 8px; padding: 12px; margin-bottom: 20px; }}
   .view.active {{ display: block; }}
   .view img {{ max-width: 100%; border-radius: 4px; }}
-  .detections {{ margin-top: 24px; }}
-  .det-card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; }}
-  .det-label {{ font-weight: 600; font-size: 1rem; min-width: 120px; }}
-  .det-score {{ font-size: 0.9rem; color: #4fc3f7; }}
-  .det-bar {{ flex: 1; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }}
+
+  .page {{ display: none; }}
+  .page.active {{ display: block; }}
+
+  .detections {{ margin-bottom: 24px; }}
+  .det-card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 10px 14px; margin-bottom: 6px; display: flex; align-items: center; gap: 10px; }}
+  .det-label {{ font-weight: 600; font-size: 0.9rem; min-width: 110px; }}
+  .det-score {{ font-size: 0.85rem; color: #4fc3f7; min-width: 50px; }}
+  .det-bar {{ flex: 1; height: 5px; background: #333; border-radius: 3px; overflow: hidden; }}
   .det-bar-fill {{ height: 100%; background: linear-gradient(90deg, #4fc3f7, #29b6f6); border-radius: 3px; }}
-  .det-meta {{ font-size: 0.75rem; color: #666; }}
-  .regions {{ margin-top: 24px; }}
-  .region-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }}
+  .det-meta {{ font-size: 0.7rem; color: #666; min-width: 80px; text-align: right; }}
+
+  .region-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }}
   .region-card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 8px; overflow: hidden; }}
   .region-card img {{ width: 100%; aspect-ratio: 1; object-fit: contain; background: #fff; }}
-  .region-info {{ padding: 8px 12px; }}
-  .region-title {{ font-weight: 600; font-size: 0.85rem; margin-bottom: 4px; }}
-  .region-scores {{ font-size: 0.75rem; color: #888; }}
-  .region-scores span {{ display: block; margin-bottom: 2px; }}
+  .region-info {{ padding: 8px 10px; }}
+  .region-title {{ font-weight: 600; font-size: 0.8rem; margin-bottom: 4px; }}
+  .region-scores {{ font-size: 0.7rem; color: #888; }}
+  .region-scores span {{ display: block; margin-bottom: 1px; }}
   .region-scores .match {{ color: #4fc3f7; font-weight: 500; }}
-  .labels-list {{ display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }}
-  .label-chip {{ background: #1a3a4a; color: #4fc3f7; padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; }}
+
+  .labels-list {{ display: flex; gap: 5px; flex-wrap: wrap; }}
+  .label-chip {{ background: #1a3a4a; color: #4fc3f7; padding: 3px 8px; border-radius: 10px; font-size: 0.7rem; }}
 </style>
 </head>
 <body>
+<div class="layout">
 
-<h1>Object Detection — FastSAM + CLIP</h1>
-<h2>YOLO-based segmentation + zero-shot classification</h2>
-
-<div class="stats">
-  <div class="stat"><div class="stat-value">{stats['image_size']}</div><div class="stat-label">Image Size</div></div>
-  <div class="stat"><div class="stat-value">{stats['num_regions']}</div><div class="stat-label">Regions Found</div></div>
-  <div class="stat"><div class="stat-value">{stats['segmentation_ms']}ms</div><div class="stat-label">Segmentation</div></div>
-  <div class="stat"><div class="stat-value">{stats['encoding_ms']}ms</div><div class="stat-label">CLIP Encoding</div></div>
-  <div class="stat"><div class="stat-value">{stats['num_detections']}</div><div class="stat-label">Detections</div></div>
-</div>
-
-<div class="labels-list">
-  {''.join(f'<span class="label-chip">{l}</span>' for l in stats['labels_searched'])}
-</div>
-
-<div class="tabs">
-  <div class="tab active" onclick="switchTab(0)">Original</div>
-  <div class="tab" onclick="switchTab(1)">Segments</div>
-  <div class="tab" onclick="switchTab(2)">Detections</div>
-</div>
-<div class="view active" id="view-0"><img src="{original_uri}"></div>
-<div class="view" id="view-1"><img src="{seg_uri}"></div>
-<div class="view" id="view-2"><img src="{det_uri}"></div>
-
-<div class="detections">
-  <h2>Detections (score ≥ 0.15)</h2>
-  {''.join(_det_card_html(d) for d in detections) or '<p style="color:#666;">No detections above threshold.</p>'}
-</div>
-
-<div class="regions">
-  <h2>All Regions (on white background)</h2>
-  <div class="region-grid">
-    {''.join(_region_card_html(r) for r in regions)}
+<div class="sidebar">
+  <h1>FastSAM + CLIP</h1>
+  <h2>{len(results)} image{"s" if len(results) != 1 else ""}</h2>
+  {nav_items}
+  <div class="labels-section">
+    <h3>Search Labels</h3>
+    <div class="labels-list">{labels_html}</div>
   </div>
 </div>
 
+<div class="main">
+  {pages}
+</div>
+
+</div>
+
 <script>
-function switchTab(idx) {{
-  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', i === idx));
-  document.querySelectorAll('.view').forEach((v, i) => v.classList.toggle('active', i === idx));
+function switchImage(idx) {{
+  document.querySelectorAll('.nav-item').forEach((n, i) => n.classList.toggle('active', i === idx));
+  document.querySelectorAll('.page').forEach((p, i) => p.classList.toggle('active', i === idx));
+}}
+
+function switchTab(el, pageIdx, viewIdx) {{
+  const page = document.getElementById('page-' + pageIdx);
+  page.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  for (let i = 0; i < 3; i++) {{
+    const v = document.getElementById('view-' + pageIdx + '-' + i);
+    if (v) v.classList.toggle('active', i === viewIdx);
+  }}
 }}
 </script>
 </body>
@@ -242,11 +309,11 @@ def _region_card_html(r):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate HTML demo for object detection")
-    parser.add_argument("image", help="Path to image file")
+    parser.add_argument("images", nargs="+", help="Path(s) to image files")
     parser.add_argument("--labels", nargs="+", required=True, help="Labels to search for")
     parser.add_argument("--output", default="demo.html", help="Output HTML path")
     args = parser.parse_args()
-    generate_html(args.image, args.labels, args.output)
+    generate_html(args.images, args.labels, args.output)
 
 
 if __name__ == "__main__":

@@ -9,5 +9,6 @@ models/
 *.onnx
 *.onnx.data
 test_images/
-demo.html
+*.html
 uv.lock
+encode_vocab.py
