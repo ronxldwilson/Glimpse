@@ -201,14 +201,58 @@ def video_mode():
             unsafe_allow_html=True
         )
 
-    # Main: frame grid + detail view
     # Object pills
     pills = " ".join(f'<span class="pill">{l} ({info["count"]})</span>' for l, info in sorted_obj)
     st.markdown(pills, unsafe_allow_html=True)
 
-    st.markdown("")
+    # Search bar
+    all_labels = sorted(all_objects.keys())
+    search = st.text_input("Search for an object", placeholder="e.g. car, knife, man...", label_visibility="collapsed")
+
+    search_term = search.strip().lower() if search else ""
+
+    if search_term:
+        # Find matching frames
+        matching_indices = []
+        for i, r in enumerate(results):
+            for d in r["detections"]:
+                if search_term in d["label"].lower():
+                    matching_indices.append(i)
+                    break
+
+        if not matching_indices:
+            st.warning(f'No frames contain "{search}"')
+        else:
+            st.markdown(
+                f'<div class="section-hdr">'
+                f'"{search}" found in {len(matching_indices)} / {len(results)} frames'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Show matching frames in a grid
+            n_cols = min(4, len(matching_indices))
+            for row_start in range(0, len(matching_indices), n_cols):
+                cols = st.columns(n_cols)
+                for j in range(n_cols):
+                    idx = row_start + j
+                    if idx >= len(matching_indices):
+                        break
+                    fi = matching_indices[idx]
+                    r = results[fi]
+                    # Highlight only matching detections
+                    matched = [d for d in r["detections"] if search_term in d["label"].lower()]
+                    highlighted = draw_boxes(r["frame"], matched)
+
+                    with cols[j]:
+                        st.image(cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB), use_container_width=True)
+                        match_labels = ", ".join(f"{d['label']} ({d['score']:.2f})" for d in matched)
+                        st.caption(f"**t={r['timestamp']:.1f}s** — {match_labels}")
+
+            st.markdown("---")
 
     # Frame browser
+    st.markdown('<div class="section-hdr">Frame Browser</div>', unsafe_allow_html=True)
     if results:
         frame_idx = st.slider(
             "Frame", 0, len(results) - 1, 0,
@@ -243,14 +287,19 @@ def video_mode():
 
     # Timeline grid
     st.markdown('<div class="section-hdr">Timeline</div>', unsafe_allow_html=True)
-    cols = st.columns(min(6, len(results)))
-    for i, r in enumerate(results):
-        col = cols[i % len(cols)]
-        with col:
-            thumb = cv2.resize(r["annotated"], (320, 180))
-            labels = ", ".join(d["label"] for d in r["detections"][:3])
-            st.image(cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB), use_container_width=True)
-            st.caption(f"**{r['timestamp']:.1f}s** — {labels}")
+    n_cols = min(6, len(results))
+    for row_start in range(0, len(results), n_cols):
+        cols = st.columns(n_cols)
+        for j in range(n_cols):
+            idx = row_start + j
+            if idx >= len(results):
+                break
+            r = results[idx]
+            with cols[j]:
+                thumb = cv2.resize(r["annotated"], (320, 180))
+                labels = ", ".join(d["label"] for d in r["detections"][:3])
+                st.image(cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB), use_container_width=True)
+                st.caption(f"**{r['timestamp']:.1f}s** — {labels}")
 
     try:
         os.unlink(video_path)
