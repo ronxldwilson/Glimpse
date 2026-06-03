@@ -1,14 +1,11 @@
+.venv/
 __pycache__/
 *.pyc
-.venv/
 *.egg-info/
 dist/
 build/
-.env
-models/
-*.onnx
-*.onnx.data
 test_images/
 *.html
-uv.lock
+models/
 data/
+.git/

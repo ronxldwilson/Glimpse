@@ -1,0 +1,7 @@
+services:
+  glimpse:
+    build: .
+    volumes:
+      - ./models:/app/models
+      - ./data:/data
+    entrypoint: ["python", "-m"]

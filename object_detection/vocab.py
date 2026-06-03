@@ -152,3 +152,9 @@ def load_cached() -> tuple[list[str], np.ndarray, dict] | None:
             paths = json.load(f)
 
     return labels, embeddings, paths
+
+
+if __name__ == "__main__":
+    from .encoder import CLIPEncoder
+    encoder = CLIPEncoder()
+    encode_and_cache(encoder)
