@@ -188,28 +188,28 @@ def video_mode():
     c1.markdown(stat_box(len(all_objects), "Objects Found"), unsafe_allow_html=True)
     c2.markdown(stat_box(f"{total_time:.1f}s", "Processed In"), unsafe_allow_html=True)
 
-    st.sidebar.markdown('<div class="section-hdr">Objects Found</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="section-hdr">Objects Found (click to filter)</div>', unsafe_allow_html=True)
     sorted_obj = sorted(all_objects.items(), key=lambda x: x[1]["count"], reverse=True)
     for label, info in sorted_obj:
         pct = info["count"] / len(results) * 100
-        st.sidebar.markdown(
-            f'<div class="ocard">'
-            f'<div class="oname">{label}</div>'
-            f'<div class="ometa">{info["count"]}x | {info["first"]:.1f}s-{info["last"]:.1f}s | peak {info["peak"]:.2f}</div>'
-            f'<div class="obar"><div class="obar-fill" style="width:{min(pct,100):.0f}%"></div></div>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+        if st.sidebar.button(
+            f"{label}  —  {info['count']}x  |  {info['first']:.1f}s-{info['last']:.1f}s  |  {info['peak']:.2f}",
+            key=f"obj_{label}",
+            use_container_width=True,
+        ):
+            st.session_state["search_query"] = label
 
     # Object pills
     pills = " ".join(f'<span class="pill">{l} ({info["count"]})</span>' for l, info in sorted_obj)
     st.markdown(pills, unsafe_allow_html=True)
 
-    # Search bar
-    all_labels = sorted(all_objects.keys())
-    search = st.text_input("Search for an object", placeholder="e.g. car, knife, man...", label_visibility="collapsed")
+    # Search bar — pre-filled when clicking sidebar objects
+    default_search = st.session_state.get("search_query", "")
+    search = st.text_input("Search for an object", value=default_search, placeholder="e.g. car, knife, man...", label_visibility="collapsed")
 
     search_term = search.strip().lower() if search else ""
+    if search_term != st.session_state.get("search_query", "").lower():
+        st.session_state["search_query"] = search
 
     if search_term:
         # Find matching frames
