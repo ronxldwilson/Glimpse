@@ -212,23 +212,61 @@ def video_mode():
         st.session_state["search_query"] = search
 
     if search_term:
-        # Find matching frames
+        # Find matching frames from existing detections
         matching_indices = []
+        matching_dets = {}  # frame_idx -> list of matching dets
         for i, r in enumerate(results):
-            for d in r["detections"]:
-                if search_term in d["label"].lower():
-                    matching_indices.append(i)
-                    break
+            matched = [d for d in r["detections"] if search_term in d["label"].lower()]
+            if matched:
+                matching_indices.append(i)
+                matching_dets[i] = matched
+
+        # Deep search: if not found in top detections, query CLIP directly
+        deep_search = False
+        frame_embeddings = st.session_state.get("frame_embeddings", [])
+        if not matching_indices and frame_embeddings:
+            deep_search = True
+            with st.spinner(f'Deep search: encoding "{search}" with CLIP...'):
+                from object_detection.encoder import CLIPEncoder
+                encoder = CLIPEncoder()
+                query_embed = encoder.encode_labels([search])[0]
+
+                deep_threshold = 0.22
+                for i, fe in enumerate(frame_embeddings):
+                    embeds = fe["embeddings"]
+                    bboxes = fe["bboxes"]
+                    if len(embeds) == 0:
+                        continue
+                    scores = embeds @ query_embed
+                    best_idx = int(np.argmax(scores))
+                    best_score = float(scores[best_idx])
+                    if best_score >= deep_threshold:
+                        matching_indices.append(i)
+                        # Find all regions above threshold
+                        frame_matches = []
+                        for ri in range(len(scores)):
+                            if scores[ri] >= deep_threshold:
+                                frame_matches.append({
+                                    "label": search,
+                                    "score": float(scores[ri]),
+                                    "bbox": bboxes[ri],
+                                    "source": "deep-clip",
+                                })
+                        frame_matches.sort(key=lambda x: x["score"], reverse=True)
+                        matching_dets[i] = frame_matches[:5]
 
         if not matching_indices:
-            st.warning(f'No frames contain "{search}"')
+            st.warning(f'"{search}" not found — not in top detections or deep CLIP search')
         else:
+            mode_label = "Deep CLIP search" if deep_search else "Found"
             st.markdown(
                 f'<div class="section-hdr">'
-                f'"{search}" found in {len(matching_indices)} / {len(results)} frames'
+                f'{mode_label}: "{search}" in {len(matching_indices)} / {len(results)} frames'
                 f'</div>',
                 unsafe_allow_html=True,
             )
+            if deep_search:
+                st.caption("This object wasn't in the top detections — searched all region embeddings with CLIP")
 
             # Show matching frames in a grid
             n_cols = min(4, len(matching_indices))
@@ -240,8 +278,7 @@ def video_mode():
                         break
                     fi = matching_indices[idx]
                     r = results[fi]
-                    # Highlight only matching detections
-                    matched = [d for d in r["detections"] if search_term in d["label"].lower()]
+                    matched = matching_dets.get(fi, [])
                     highlighted = draw_boxes(r["frame"], matched)
 
                     with cols[j]:
@@ -310,6 +347,8 @@ def video_mode():
 def _run_analysis(video_path, extract_mode, max_frames):
     from object_detection.video import extract_keyframes
     from object_detection.moe import detect_moe, reset_tracker
+    from object_detection.segment import segment, merge_nearby_regions, extract_region_image
+    from object_detection.encoder import CLIPEncoder
 
     with st.spinner("Extracting keyframes..."):
         if extract_mode == "Scene detection":
@@ -318,13 +357,27 @@ def _run_analysis(video_path, extract_mode, max_frames):
             keyframes = extract_keyframes(video_path, mode="fixed", fixed_fps=1.0, max_frames=max_frames)
 
     reset_tracker()
+    encoder = CLIPEncoder()
     progress = st.progress(0, text="Analyzing...")
     results = []
     all_objects = {}
+    frame_embeddings = []  # store per-frame region embeddings for deep search
     t_start = time.perf_counter()
 
     for i, (ts, frame) in enumerate(keyframes):
         detections = detect_moe(frame)
+
+        # Store region embeddings for deep search
+        regions = segment(frame)
+        regions = merge_nearby_regions(frame, regions)
+        if regions:
+            region_images = [extract_region_image(frame, r) for r in regions]
+            embeds = encoder.encode_images(region_images)
+            bboxes = [r.bbox for r in regions]
+        else:
+            embeds = np.zeros((0, 512), dtype=np.float32)
+            bboxes = []
+        frame_embeddings.append({"embeddings": embeds, "bboxes": bboxes})
 
         frame_dets = []
         for d in detections:
@@ -349,6 +402,7 @@ def _run_analysis(video_path, extract_mode, max_frames):
     st.session_state["results"] = results
     st.session_state["all_objects"] = all_objects
     st.session_state["total_time"] = total_time
+    st.session_state["frame_embeddings"] = frame_embeddings
 
 
 if __name__ == "__main__":
